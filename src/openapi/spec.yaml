@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: CaseCellShop
+  version: 1.0.0
+  x-logo:
+    url: https://api.casecellshop.com/assets/logo.svg
+    altText: CaseCellShop Logo
+  description: |
+    Welcome to the **CaseCellShop Service** reference. This service orchestrates our product catalog with sub-millisecond Redis caching, manages resilient asynchronous checkouts with atomicity, and provides real-time order lifecycle tracking.
+
+    ---
+
+    ### ⚡ Async Checkout Flow
+    To handle intense traffic surges without database lock contention, our checkout architecture processes operations asynchronously via worker queues.
+
+    1. **Initiation:** `POST /checkout` registers a purchase intent, executes atomic stock allocation, and returns `202 Accepted` with a tracking `orderId`.
+    2. **Polling:** The client polls `GET /orders/{orderId}/status` using an **exponential backoff strategy**.
+    3. **Lifecycle:** Orders transition linearly through the states: `pending` ➔ `processing` ➔ `completed` | `failed`.
+
+    ### 🔒 Idempotency & Safety
+    Every checkout intent **must** carry a client-generated UUID in the `idempotencyKey` field. Retrying transient connection failures with the same key safely yields the existing resource state without duplicate billing or double inventory allocation.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+x-tagGroups:
+  - name: Core Services
+    tags:
+      - Products
+      - Checkout
+      - Orders
+  - name: Infrastructure
+    tags:
+      - Observability
+
+tags:
+  - name: Products
+    description: Product catalog management and cached inventory lookups.
+  - name: Checkout
+    description: Asynchronous transaction processing and order ingestion.
+  - name: Orders
+    description: Lifecycle tracking and state monitoring for processed checkouts.
+  - name: Observability
+    description: Operational telemetry, infrastructure metrics, and health probes.
+
+paths:
+  /products:
+    get:
+      tags: [Products]
+      summary: List product catalog
+      description: |
+        Returns a list of all available items in the catalog. 
+        
+        **Caching Strategy:** Responses are cached in Redis with a Time-To-Live (TTL) of 60 seconds. Always inspect the `X-Cache` header to gauge cache performance (`HIT` or `MISS`).
+      parameters:
+        - in: header
+          name: X-Correlation-ID
+          schema:
+            type: string
+          required: false
+          description: Optional tracking ID for distributed tracing. If omitted, the server generates and returns a new one.
+      responses:
+        '200':
+          description: Product list retrieved successfully (potentially from cache).
+          headers:
+            X-Cache:
+              schema:
+                type: string
+                enum: [HIT, MISS]
+              description: Indicates if the response was served from the Redis cache layer.
+            X-Correlation-ID:
+              schema:
+                type: string
+              description: The tracking ID associated with this lifecycle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductListResponse'
+              examples:
+                cached:
+                  summary: Cache HIT response
+                  value:
+                    data:
+                      - id: prod-001
+                        sku: CC-IP15-BLK
+                        name: Capinha iPhone 15 Preta
+                        description: Silicone premium com proteção MagSafe
+                        price: 4990
+                        stock: 150
+                        category: iPhone
+                    meta:
+                      count: 1
+                      cachedResponse: true
+                      correlationId: 550e8400-e29b-41d4-a716-446655440000
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /checkout:
+    post:
+      tags: [Checkout]
+      summary: Initiate async checkout
+      description: |
+        Atomically leases requested inventory and enqueues an asynchronous ERP billing job.
+        
+        This endpoint returns a `202 Accepted` response immediately. Clients must capture the returned `orderId` and transition to the polling endpoint to track final completion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+            examples:
+              basic:
+                summary: Standard checkout payload
+                value:
+                  productId: prod-001
+                  quantity: 2
+                  idempotencyKey: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+      responses:
+        '202':
+          description: Order accepted and successfully queued for background processing.
+          headers:
+            X-Idempotent-Replay:
+              schema:
+                type: string
+                enum: ['true', 'false']
+              description: Evaluates to `true` if this request was a duplicate replay processed safely via the idempotency layer.
+            X-Correlation-ID:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutResponse'
+              example:
+                orderId: ord-550e8400-e29b-41d4-a716-446655440000
+                status: pending
+                message: Order accepted and queued for processing
+                correlationId: 550e8400-e29b-41d4-a716-446655440000
+                _links:
+                  status: /orders/ord-550e8400-e29b-41d4-a716-446655440000/status
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          description: Product identifier could not be found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: PRODUCT_NOT_FOUND
+                message: Product prod-999 not found
+                correlationId: 550e8400-e29b-41d4-a716-446655440000
+        '409':
+          description: Insufficient stock available. The transaction was aborted to prevent overselling.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: INSUFFICIENT_STOCK
+                message: "Insufficient stock for product prod-001. Requested: 5"
+                correlationId: 550e8400-e29b-41d4-a716-446655440000
+        '422':
+          description: Invalid quantity format or constraint violation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /orders/{orderId}/status:
+    get:
+      tags: [Orders]
+      summary: Poll order status
+      description: |
+        Retrieves the runtime state of an asynchronous order transaction.
+
+        **Recommended Polling Strategy:** Implement an exponential backoff routine (e.g., 1s, 2s, 4s, 8s, up to 16s). Clients should cease polling immediately when the status resolves into a terminal state (`completed` or `failed`), denoted by the absence of the `_links.poll` relation.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema:
+            type: string
+          example: ord-550e8400-e29b-41d4-a716-446655440000
+          description: The unique tracking identifier received during checkout initiation.
+      responses:
+        '200':
+          description: Order status object payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderStatusResponse'
+              examples:
+                pending:
+                  summary: Order is in queue (Pending)
+                  value:
+                    orderId: ord-550e8400-e29b-41d4-a716-446655440000
+                    status: pending
+                    productId: prod-001
+                    quantity: 2
+                    createdAt: '2024-07-01T12:00:00.000Z'
+                    updatedAt: '2024-07-01T12:00:00.100Z'
+                    correlationId: 550e8400-e29b-41d4-a716-446655440000
+                    _links:
+                      poll: /orders/ord-550e8400-e29b-41d4-a716-446655440000/status
+                completed:
+                  summary: Order processed successfully (Completed)
+                  value:
+                    orderId: ord-550e8400-e29b-41d4-a716-446655440000
+                    status: completed
+                    productId: prod-001
+                    quantity: 2
+                    erpOrderRef: ERP-1720000000000
+                    createdAt: '2024-07-01T12:00:00.000Z'
+                    updatedAt: '2024-07-01T12:00:03.500Z'
+                    correlationId: 550e8400-e29b-41d4-a716-446655440000
+                    _links: {}
+                failed:
+                  summary: Processing failed at ERP layer (Failed)
+                  value:
+                    orderId: ord-550e8400-e29b-41d4-a716-446655440000
+                    status: failed
+                    errorMessage: 'ERP failed after all retries'
+                    createdAt: '2024-07-01T12:00:00.000Z'
+                    updatedAt: '2024-07-01T12:00:12.000Z'
+                    correlationId: 550e8400-e29b-41d4-a716-446655440000
+                    _links: {}
+        '404':
+          description: Requested order identifier could not be found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: ORDER_NOT_FOUND
+                message: Order ord-abc not found
+                correlationId: 550e8400-e29b-41d4-a716-446655440000
+
+  /metrics:
+    get:
+      tags: [Observability]
+      summary: In-memory service metrics
+      description: |
+        Exposes volatile in-memory counters, checkout throughput metrics, and internal worker queue depth snapshots.
+        
+        *Note: In production environments, this operational data maps directly into Datadog metrics via an upstream DogStatsD sidecar agent.*
+      responses:
+        '200':
+          description: Current runtime operational telemetry snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+
+  /health:
+    get:
+      tags: [Observability]
+      summary: Liveness probe
+      description: Evaluates application orchestration status. Used primarily by Kubernetes liveness probes or health checkers to confirm process health.
+      responses:
+        '200':
+          description: Service is healthy and capable of accepting traffic.
+          content:
+            application/json:
+              example:
+                status: ok
+                ts: '2024-07-01T12:00:00.000Z'
+
+components:
+  schemas:
+    Product:
+      type: object
+      required: [id, sku, name, price, stock, category]
+      properties:
+        id:
+          type: string
+          example: prod-001
+        sku:
+          type: string
+          example: CC-IP15-BLK
+        name:
+          type: string
+          example: Capinha iPhone 15 Preta
+        description:
+          type: string
+          example: Premium high-grade protective silicone case.
+        price:
+          type: integer
+          description: Product unit price represented in minor currency units / BRL cents (e.g., `4990` maps to R$ 49,90).
+          example: 4990
+        stock:
+          type: integer
+          example: 150
+        category:
+          type: string
+          example: iPhone
+
+    ProductListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        meta:
+          type: object
+          properties:
+            count:
+              type: integer
+              example: 1
+            cachedResponse:
+              type: boolean
+              example: true
+            correlationId:
+              type: string
+              example: 550e8400-e29b-41d4-a716-446655440000
+
+    CheckoutRequest:
+      type: object
+      required: [productId, quantity, idempotencyKey]
+      properties:
+        productId:
+          type: string
+          example: prod-001
+        quantity:
+          type: integer
+          minimum: 1
+          example: 2
+        idempotencyKey:
+          type: string
+          description: Unique client-side generated UUID to explicitly deduplicate concurrent API retry loops.
+          example: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+
+    CheckoutResponse:
+      type: object
+      properties:
+        orderId:
+          type: string
+          example: ord-550e8400-e29b-41d4-a716-446655440000
+        status:
+          type: string
+          enum: [pending]
+          example: pending
+        message:
+          type: string
+          example: Order accepted and queued for processing
+        correlationId:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+        _links:
+          type: object
+          properties:
+            status:
+              type: string
+              example: /orders/ord-550e8400-e29b-41d4-a716-446655440000/status
+
+    OrderStatusResponse:
+      type: object
+      properties:
+        orderId:
+          type: string
+          example: ord-550e8400-e29b-41d4-a716-446655440000
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+          example: completed
+        productId:
+          type: string
+          example: prod-001
+        quantity:
+          type: integer
+          example: 2
+        createdAt:
+          type: string
+          format: date-time
+          example: '2024-07-01T12:00:00.000Z'
+        updatedAt:
+          type: string
+          format: date-time
+          example: '2024-07-01T12:00:03.500Z'
+        erpOrderRef:
+          type: string
+          description: Downstream transaction sequence identifier emitted by the corporate ERP upon successful ledger billing.
+          example: ERP-1720000000000
+        errorMessage:
+          type: string
+          example: ERP failed after all retries
+        correlationId:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+        _links:
+          type: object
+          properties:
+            poll:
+              type: string
+              description: Contextual hypermedia link. Present only while the processing state is non-terminal.
+              example: /orders/ord-550e8400-e29b-41d4-a716-446655440000/status
+
+    MetricsResponse:
+      type: object
+      properties:
+        cache:
+          type: object
+          properties:
+            hit: 
+              type: integer
+              example: 853
+            miss: 
+              type: integer
+              example: 147
+            hitRate: 
+              type: string
+              example: '85.3%'
+        checkout:
+          type: object
+          properties:
+            enqueued: 
+              type: integer
+              example: 1250
+            completed: 
+              type: integer
+              example: 1242
+            failed: 
+              type: integer
+              example: 4
+            oversellBlocked: 
+              type: integer
+              example: 4
+        queue:
+          type: object
+          properties:
+            waiting: 
+              type: integer
+              example: 0
+            active: 
+              type: integer
+              example: 2
+        startedAt:
+          type: string
+          format: date-time
+          example: '2024-07-01T00:00:00.000Z'
+        uptimeSeconds:
+          type: integer
+          example: 43200
+
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          example: INSUFFICIENT_STOCK
+        message:
+          type: string
+          example: "Insufficient stock for product prod-001. Requested: 5"
+        correlationId:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+
+  responses:
+    ValidationError:
+      description: The payload components missing mandatory fields or containing invalid structural schemas.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: VALIDATION_ERROR
+            message: productId is required
+            correlationId: 550e8400-e29b-41d4-a716-446655440000
+    InternalError:
+      description: An unhandled structural fault or downstream fatal break in processing logic occurred.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: INTERNAL_ERROR
+            message: An unexpected error occurred processing your payload.
+            correlationId: 550e8400-e29b-41d4-a716-446655440000
+    ServiceUnavailable:
+      description: An essential service or data persistence module was unreachable within acceptable latency limits.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: SERVICE_UNAVAILABLE
+            message: Could not fetch product catalog from repository.
+            correlationId: 550e8400-e29b-41d4-a716-446655440000
