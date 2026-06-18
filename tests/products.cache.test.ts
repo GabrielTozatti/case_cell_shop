@@ -27,6 +27,17 @@ const mockRedis = {
         });
         return "OK";
     },
+    mget: async (...keys: string[]) => {
+        return keys.map((key) => {
+            const entry = redisStore.get(key);
+            if (!entry) return null;
+            if (entry.expiresAt && Date.now() > entry.expiresAt) {
+                redisStore.delete(key);
+                return null;
+            }
+            return entry.value;
+        });
+    },
     del: async (key: string) => {
         redisStore.delete(key);
         return 1;
@@ -58,9 +69,10 @@ describe("Products Cache — Cache-Aside Strategy", () => {
     });
 
     it("should call ERP on first request (cache MISS) and populate cache", async () => {
-        const products = await productsService.getAll("corr-001");
+        const result = await productsService.getAll("corr-001");
 
-        expect(products).toHaveLength(2);
+        expect(result.products).toHaveLength(2);
+        expect(result.fromCache).toBe(false);
         expect(mockErpCall).toHaveBeenCalledTimes(1);
 
         const snapshot = metrics.snapshot();
@@ -75,9 +87,10 @@ describe("Products Cache — Cache-Aside Strategy", () => {
         mockErpCall.mockClear();
         metrics.reset();
 
-        const products = await productsService.getAll("corr-002");
+        const result = await productsService.getAll("corr-002");
 
-        expect(products).toHaveLength(2);
+        expect(result.products).toHaveLength(2);
+        expect(result.fromCache).toBe(true);
         expect(mockErpCall).not.toHaveBeenCalled();
 
         const snapshot = metrics.snapshot();

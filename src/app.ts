@@ -24,6 +24,20 @@ export const createApp = () => {
     app.use(correlationIdMiddleware);
     app.use(requestLoggerMiddleware);
 
+    app.use((req, res, next) => {
+        if (
+            (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") &&
+            !req.headers["content-type"]?.startsWith("application/json")
+        ) {
+            res.status(415).json({
+                error: "UNSUPPORTED_MEDIA_TYPE",
+                message: "Content-Type must be application/json",
+            });
+            return;
+        }
+        next();
+    });
+
     app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
     app.use("/products", productsRouter);
@@ -58,8 +72,13 @@ export const createApp = () => {
         }
     });
 
-    app.get("/health", (_req: Request, res: Response) => {
-        res.status(200).json({ status: "ok", ts: new Date().toISOString() });
+    app.get("/health", async (_req: Request, res: Response) => {
+        try {
+            await getRedis().ping();
+            res.status(200).json({ status: "ok", ts: new Date().toISOString() });
+        } catch {
+            res.status(503).json({ status: "degraded", ts: new Date().toISOString() });
+        }
     });
 
     app.use((req: Request, res: Response) => {

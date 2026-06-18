@@ -5,13 +5,22 @@ import { productsRepository, type Product } from "./products.repository.js";
 import { env } from "../../config/env.js";
 
 const CACHE_KEY = "catalog:all";
+const STOCK_KEY = (productId: string) => `stock:${productId}`;
+
+interface GetAllResult {
+    products: Product[];
+    fromCache: boolean;
+}
 
 export const productsService = {
-    async getAll(correlationId: string): Promise<Product[]> {
+    async getAll(correlationId: string): Promise<GetAllResult> {
         const log = createRequestLogger(correlationId);
         const redis = getRedis();
 
         const spanId = `span-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        let products: Product[];
+        let fromCache = false;
 
         const cached = await redis.get(CACHE_KEY);
 
@@ -26,45 +35,56 @@ export const productsService = {
                 },
                 "Cache HIT — returning cached catalog",
             );
-            return JSON.parse(cached) as Product[];
-        }
-
-        metrics.cacheMiss();
-        log.info(
-            {
-                spanId,
-                component: "products-service",
-                cacheKey: CACHE_KEY,
-                result: "MISS",
-            },
-            "Cache MISS — fetching from ERP repository",
-        );
-
-        const products = await productsRepository.findAll();
-
-        try {
-            await redis.set(
-                CACHE_KEY,
-                JSON.stringify(products),
-                "EX",
-                env.PRODUCT_CACHE_TTL,
-            );
+            products = JSON.parse(cached) as Product[];
+            fromCache = true;
+        } else {
+            metrics.cacheMiss();
             log.info(
                 {
                     spanId,
                     component: "products-service",
-                    ttl: env.PRODUCT_CACHE_TTL,
+                    cacheKey: CACHE_KEY,
+                    result: "MISS",
                 },
-                "Cache populated",
+                "Cache MISS — fetching from ERP repository",
             );
-        } catch (err) {
-            log.warn(
-                { spanId, component: "products-service", err },
-                "Failed to populate cache — serving uncached response",
-            );
+
+            products = await productsRepository.findAll();
+
+            try {
+                await redis.set(
+                    CACHE_KEY,
+                    JSON.stringify(products),
+                    "EX",
+                    env.PRODUCT_CACHE_TTL,
+                );
+                log.info(
+                    {
+                        spanId,
+                        component: "products-service",
+                        ttl: env.PRODUCT_CACHE_TTL,
+                    },
+                    "Cache populated",
+                );
+            } catch (err) {
+                log.warn(
+                    { spanId, component: "products-service", err },
+                    "Failed to populate cache — serving uncached response",
+                );
+            }
         }
 
-        return products;
+        const stockKeys = products.map((p) => STOCK_KEY(p.id));
+        const stockValues = await redis.mget(...stockKeys);
+        const enriched = products.map((product, i) => ({
+            ...product,
+            stock:
+                stockValues[i] !== null
+                    ? Math.max(0, parseInt(stockValues[i], 10))
+                    : product.stock,
+        }));
+
+        return { products: enriched, fromCache };
     },
 
     async invalidateCache(): Promise<void> {

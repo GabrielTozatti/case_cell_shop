@@ -10,19 +10,16 @@ const connection = {
     port: env.REDIS_PORT,
 };
 
-const incrementMetric = async (field: string): Promise<void> => {
+const updateMetric = async (field: string, delta: number = 1): Promise<void> => {
     try {
-        await getRedis().hincrby("metrics:checkout", field, 1);
+        if (delta === 0) return;
+        await getRedis().hincrby("metrics:checkout", field, delta);
     } catch (error) {
-        logger.warn(
-            {
-                error,
-                field,
-            },
-            "Failed to increment checkout metric",
-        );
+        logger.warn({ error, field, delta }, "Failed to update checkout metric");
     }
 };
+
+const STOCK_KEY = (productId: string) => `stock:${productId}`;
 
 const processCheckout = async (job: Job<CheckoutJobData>): Promise<void> => {
     const { orderId, productId, quantity, correlationId } = job.data;
@@ -40,50 +37,56 @@ const processCheckout = async (job: Job<CheckoutJobData>): Promise<void> => {
         "Processing checkout job",
     );
 
-    await incrementMetric("active");
+    await updateMetric("active", 1);
 
-    await ordersRepository.updateStatus(orderId, "processing");
+    try {
+        await ordersRepository.updateStatus(orderId, "processing");
 
-    await new Promise((resolve) =>
-        setTimeout(resolve, env.ERP_PROCESSING_DELAY_MS),
-    );
-
-    const shouldFail = Math.random() < 0.1;
-
-    if (shouldFail && job.attemptsMade < job.opts.attempts! - 1) {
-        log.warn(
-            { spanId, component: "worker" },
-            "ERP returned error — will retry",
+        await new Promise((resolve) =>
+            setTimeout(resolve, env.ERP_PROCESSING_DELAY_MS),
         );
-        throw new Error("ERP_TIMEOUT: billing service did not respond in time");
-    }
 
-    if (shouldFail) {
+        const shouldFail = Math.random() < 0.1;
+
+        if (shouldFail && job.attemptsMade < job.opts.attempts! - 1) {
+            log.warn(
+                { spanId, component: "worker" },
+                "ERP returned error — will retry",
+            );
+            throw new Error("ERP_TIMEOUT: billing service did not respond in time");
+        }
+
+        if (shouldFail) {
+            await ordersRepository.updateStatus(
+                orderId,
+                "failed",
+                "ERP failed after all retries",
+            );
+            const redis = getRedis();
+            await redis.incrby(STOCK_KEY(productId), quantity);
+            await updateMetric("failed", 1);
+            log.error(
+                { spanId, component: "worker" },
+                "Checkout failed after all retries — stock replenished",
+            );
+            return;
+        }
+
+        const erpOrderRef = `ERP-${Date.now()}`;
         await ordersRepository.updateStatus(
             orderId,
-            "failed",
-            "ERP failed after all retries",
+            "completed",
+            undefined,
+            erpOrderRef,
         );
-        await incrementMetric("failed");
-        log.error(
-            { spanId, component: "worker" },
-            "Checkout failed after all retries",
+        await updateMetric("completed", 1);
+        log.info(
+            { spanId, component: "worker", erpOrderRef },
+            "Checkout completed successfully",
         );
-        return;
+    } finally {
+        await updateMetric("active", -1);
     }
-
-    const erpOrderRef = `ERP-${Date.now()}`;
-    await ordersRepository.updateStatus(
-        orderId,
-        "completed",
-        undefined,
-        erpOrderRef,
-    );
-    await incrementMetric("completed");
-    log.info(
-        { spanId, component: "worker", erpOrderRef },
-        "Checkout completed successfully",
-    );
 };
 
 const start = async () => {

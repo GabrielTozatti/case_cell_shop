@@ -24,7 +24,8 @@ export type CheckoutResult =
       };
 
 const STOCK_KEY = (productId: string) => `stock:${productId}`;
-const IDEMPOTENCY_TTL = 86400;
+const orderKey = (id: string) => `order:${id}`;
+const idempKey = (key: string) => `idempotency:${key}`;
 
 export const checkoutService = {
     async initiateCheckout(
@@ -74,7 +75,7 @@ export const checkoutService = {
         const redis = getRedis();
         const stockKey = STOCK_KEY(productId);
 
-        await redis.set(stockKey, product.stock, "EX", IDEMPOTENCY_TTL, "NX");
+        await redis.set(stockKey, product.stock, "NX");
 
         const remaining = await redis.decrby(stockKey, quantity);
 
@@ -113,6 +114,7 @@ export const checkoutService = {
         };
 
         await ordersRepository.create(order);
+
         log.info(
             {
                 spanId,
@@ -125,14 +127,33 @@ export const checkoutService = {
             "Order created, stock reserved",
         );
 
+        const queue = getCheckoutQueue();
         const jobData: CheckoutJobData = {
             orderId,
             productId,
             quantity,
             correlationId,
         };
-        const queue = getCheckoutQueue();
-        await queue.add("process-checkout", jobData, { jobId: orderId });
+
+        try {
+            await queue.add("process-checkout", jobData, { jobId: orderId });
+        } catch (err) {
+            log.error(
+                { spanId, component: "checkout-service", orderId, err },
+                "Failed to enqueue checkout job — rolling back order and stock",
+            );
+            try {
+                await redis.del(orderKey(orderId));
+                await redis.del(idempKey(order.idempotencyKey));
+                await redis.incrby(stockKey, quantity);
+            } catch (rollbackErr) {
+                log.error(
+                    { spanId, component: "checkout-service", rollbackErr },
+                    "Rollback also failed — manual intervention required",
+                );
+            }
+            throw new Error("Failed to enqueue checkout job after order creation");
+        }
 
         metrics.checkoutEnqueued();
         log.info(

@@ -1,6 +1,13 @@
 import { Router, type Request, type Response } from "express";
+import { z } from "zod";
 import { checkoutService } from "./checkout.service.js";
 import { createRequestLogger } from "../../observability/logger.js";
+
+const checkoutSchema = z.object({
+    productId: z.string().min(1, "productId is required"),
+    quantity: z.number().int().positive("quantity must be a positive integer"),
+    idempotencyKey: z.string().min(1, "idempotencyKey is required"),
+});
 
 export const checkoutRouter = Router();
 
@@ -8,32 +15,27 @@ checkoutRouter.post("/", async (req: Request, res: Response) => {
     const { correlationId } = res.locals;
     const log = createRequestLogger(correlationId);
 
-    const { productId, quantity, idempotencyKey } = req.body;
+    if (!req.body || typeof req.body !== "object") {
+        res.status(415).json({
+            error: "UNSUPPORTED_MEDIA_TYPE",
+            message: "Request body must be valid JSON with Content-Type: application/json",
+            correlationId,
+        });
+        return;
+    }
 
-    if (!productId || typeof productId !== "string") {
+    const parsed = checkoutSchema.safeParse(req.body);
+    if (!parsed.success) {
+        const firstIssue = parsed.error.issues[0];
         res.status(400).json({
             error: "VALIDATION_ERROR",
-            message: "productId is required",
+            message: firstIssue.message,
             correlationId,
         });
         return;
     }
-    if (!idempotencyKey || typeof idempotencyKey !== "string") {
-        res.status(400).json({
-            error: "VALIDATION_ERROR",
-            message: "idempotencyKey is required",
-            correlationId,
-        });
-        return;
-    }
-    if (quantity === undefined || quantity === null) {
-        res.status(400).json({
-            error: "VALIDATION_ERROR",
-            message: "quantity is required",
-            correlationId,
-        });
-        return;
-    }
+
+    const { productId, quantity, idempotencyKey } = parsed.data;
 
     try {
         const result = await checkoutService.initiateCheckout(

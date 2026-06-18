@@ -23,6 +23,7 @@ A aplicação foi construída com foco em:
 | **Observabilidade** | pino | Logs estruturados em JSON |
 | **Testes** | Vitest | Testes unitários e integração |
 | **Containerização** | Docker Compose | Infraestrutura local |
+| **Validação** | zod | Schemas de entrada da API |
 
 ---
 
@@ -98,7 +99,7 @@ Isso evita:
 - Retry inseguro
 - Duplicação de pedidos
 
-A chave permanece armazenada no Redis por 24h.
+A chave permanece armazenada no Redis por 7 dias.
 
 ---
 
@@ -190,7 +191,7 @@ http://localhost:3000
 
 ## 6. Executar Worker
 
-Em outro terminal:
+O worker processa os pedidos da fila (simulando faturamento no ERP). Deve ser executado em paralelo com a API, compartilhando a mesma instância Redis:
 
 ```bash
 npm run worker
@@ -241,6 +242,8 @@ X-Cache: MISS
 
 Realiza reserva de estoque e envia pedido para processamento assíncrono.
 
+> **Content-Type:** obrigatório `application/json`. A API retorna **415 UNSUPPORTED_MEDIA_TYPE** caso o header esteja ausente ou o corpo não seja um JSON válido.
+
 ### Exemplo
 
 ```bash
@@ -253,18 +256,31 @@ curl -X POST http://localhost:3000/checkout \
   }'
 ```
 
-### Resposta
+### Resposta (202 Accepted)
 
 ```json
 {
   "orderId": "ord-550e8400",
   "status": "pending",
   "message": "Order accepted and queued for processing",
+  "correlationId": "corr-a1b2c3d4",
   "_links": {
     "status": "/orders/ord-550e8400/status"
   }
 }
 ```
+
+> **Header:** `X-Idempotent-Replay: true` quando a mesma `idempotencyKey` já foi processada.
+
+### Possíveis erros
+
+| Status | Código | Motivo |
+|--------|--------|--------|
+| 400 | `VALIDATION_ERROR` | Campos obrigatórios ausentes ou inválidos |
+| 404 | `PRODUCT_NOT_FOUND` | Produto inexistente |
+| 409 | `INSUFFICIENT_STOCK` | Estoque insuficiente |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Content-Type não é `application/json` ou corpo inválido |
+| 500 | `INTERNAL_ERROR` | Erro interno do servidor |
 
 ---
 
@@ -278,14 +294,63 @@ Consulta o status do pedido.
 curl http://localhost:3000/orders/ord-550e8400/status
 ```
 
-### Possíveis estados
+### Resposta
 
-```txt
-pending
-processing
-completed
-failed
+```json
+{
+  "orderId": "ord-550e8400",
+  "status": "processing",
+  "productId": "prod-001",
+  "quantity": 2,
+  "createdAt": "2026-06-18T21:00:00.000Z",
+  "updatedAt": "2026-06-18T21:00:05.000Z",
+  "correlationId": "corr-a1b2c3d4",
+  "_links": {
+    "poll": "/orders/ord-550e8400/status"
+  }
+}
 ```
+
+> O campo `_links.poll` está presente apenas em estados não terminais (`pending`, `processing`).
+> Em estados terminais (`completed`, `failed`) os campos `erpOrderRef` e `errorMessage` podem aparecer respectivamente.
+
+### Estados possíveis
+
+| Estado | Descrição |
+|--------|-----------|
+| `pending` | Pedido recebido, aguardando processamento |
+| `processing` | Pedido em processamento no ERP |
+| `completed` | Pedido faturado com sucesso |
+| `failed` | Falha após todas as tentativas de retry |
+
+### Erros
+
+| Status | Código | Motivo |
+|--------|--------|--------|
+| 404 | `ORDER_NOT_FOUND` | `orderId` não encontrado |
+
+---
+
+## `GET /health`
+
+Verifica a saúde da aplicação e conectividade com Redis.
+
+### Exemplo
+
+```bash
+curl http://localhost:3000/health
+```
+
+### Resposta (ok)
+
+```json
+{
+  "status": "ok",
+  "ts": "2026-06-18T21:00:00.000Z"
+}
+```
+
+> Retorna **503** com `"status": "degraded"` se o Redis estiver inacessível.
 
 ---
 
@@ -297,6 +362,18 @@ Retorna métricas internas da aplicação.
 
 ```bash
 curl http://localhost:3000/metrics
+```
+
+### Resposta
+
+```json
+{
+  "cache": { "hit": 42, "miss": 10, "hitRate": "80.8%" },
+  "checkout": { "enqueued": 100, "completed": 90, "failed": 5, "oversellBlocked": 3 },
+  "queue": { "waiting": 2, "active": 1 },
+  "startedAt": "2026-06-18T21:00:00.000Z",
+  "uptimeSeconds": 3600
+}
 ```
 
 ---
@@ -357,10 +434,11 @@ Escolhido para:
 
 A aplicação utiliza:
 
-- `pino`
-- métricas in-memory
-- correlationId
-- spanId local
+- `pino` (logs estruturados)
+- `correlationId` para correlação de requests
+- `spanId` local para tracing
+- Métricas in-memory (cache hit/miss, checkout enqueued)
+- Métricas no Redis via `HINCRBY` (worker: active, completed, failed)
 
 Em produção:
 
@@ -441,16 +519,16 @@ Tipos de testes:
 
 Caso o projeto evoluísse para produção, algumas melhorias seriam:
 
-- PostgreSQL para persistência de pedidos
-- Dead Letter Queue
-- Webhooks/WebSocket
-- OpenTelemetry real
-- Prometheus + Grafana
-- Rate limiting
-- JWT/Auth middleware
-- Circuit breaker para ERP
-- Kubernetes + autoscaling
-- CI/CD pipeline
+- PostgreSQL para persistência de pedidos (substituindo Redis)
+- Dead Letter Queue para pedidos com falha permanente
+- Webhooks/WebSocket para notificação em tempo real
+- OpenTelemetry real com exportação distribuída
+- Prometheus + Grafana para dashboards persistentes
+- Rate limiting por IP/chave de API
+- JWT/Auth middleware para autenticação
+- Circuit breaker para chamadas ao ERP
+- Kubernetes + autoscaling baseado em métricas de fila
+- CI/CD pipeline com validação automatizada
 
 ---
 

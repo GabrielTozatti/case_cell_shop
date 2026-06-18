@@ -83,12 +83,4 @@ export const productsRepository = {
         return PRODUCT_MAP.get(id) ?? null;
     },
 
-    resetStock(productId: string, quantity: number): void {
-        const product = PRODUCT_MAP.get(productId);
-        if (product) {
-            product.stock = quantity;
-            const idx = PRODUCTS.findIndex((p) => p.id === productId);
-            if (idx !== -1) PRODUCTS[idx] = product;
-        }
-    },
 };
